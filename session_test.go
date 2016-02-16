@@ -451,13 +451,14 @@ func (s *S) TestUpsert(c *C) {
 
 	ns := []int{40, 41, 42, 43, 44, 45, 46}
 	for _, n := range ns {
-		err := coll.Insert(M{"k": n, "n": n})
+		err := coll.Insert(bson.D{{"k", n}, {"n", n}})
 		c.Assert(err, IsNil)
 	}
 
-	info, err := coll.Upsert(M{"k": 42}, M{"k": 42, "n": 24})
+	info, err := coll.Upsert(M{"k": 42}, bson.D{{"k", 42}, {"n", 24}})
 	c.Assert(err, IsNil)
 	c.Assert(info.Updated, Equals, 1)
+	c.Assert(info.Matched, Equals, 1)
 	c.Assert(info.UpsertedId, IsNil)
 
 	result := M{}
@@ -465,10 +466,18 @@ func (s *S) TestUpsert(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(result["n"], Equals, 24)
 
+	// Match but do not change.
+	info, err = coll.Upsert(M{"k": 42}, bson.D{{"k", 42}, {"n", 24}})
+	c.Assert(err, IsNil)
+	c.Assert(info.Updated, Equals, 1) // On 2.6+ this feels like a server mistake.
+	c.Assert(info.Matched, Equals, 1)
+	c.Assert(info.UpsertedId, IsNil)
+
 	// Insert with internally created id.
 	info, err = coll.Upsert(M{"k": 47}, M{"k": 47, "n": 47})
 	c.Assert(err, IsNil)
 	c.Assert(info.Updated, Equals, 0)
+	c.Assert(info.Matched, Equals, 0)
 	c.Assert(info.UpsertedId, NotNil)
 
 	err = coll.Find(M{"k": 47}).One(result)
@@ -484,6 +493,7 @@ func (s *S) TestUpsert(c *C) {
 	info, err = coll.Upsert(M{"k": 48}, M{"k": 48, "n": 48, "_id": 48})
 	c.Assert(err, IsNil)
 	c.Assert(info.Updated, Equals, 0)
+	c.Assert(info.Matched, Equals, 0)
 	if s.versionAtLeast(2, 6) {
 		c.Assert(info.UpsertedId, Equals, 48)
 	} else {
@@ -545,14 +555,20 @@ func (s *S) TestUpdateAll(c *C) {
 		c.Assert(err, IsNil)
 	}
 
-	// Don't actually modify the documents. Should still report 4 matching updates.
 	info, err := coll.UpdateAll(M{"k": M{"$gt": 42}}, M{"$unset": M{"missing": 1}})
 	c.Assert(err, IsNil)
-	c.Assert(info.Updated, Equals, 4)
+	if s.versionAtLeast(2, 6) {
+		c.Assert(info.Updated, Equals, 0)
+		c.Assert(info.Matched, Equals, 4)
+	} else {
+		c.Assert(info.Updated, Equals, 4)
+		c.Assert(info.Matched, Equals, 4)
+	}
 
 	info, err = coll.UpdateAll(M{"k": M{"$gt": 42}}, M{"$inc": M{"n": 1}})
 	c.Assert(err, IsNil)
 	c.Assert(info.Updated, Equals, 4)
+	c.Assert(info.Matched, Equals, 4)
 
 	result := make(M)
 	err = coll.Find(M{"k": 42}).One(result)
@@ -659,6 +675,7 @@ func (s *S) TestRemoveAll(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(info.Updated, Equals, 0)
 	c.Assert(info.Removed, Equals, 4)
+	c.Assert(info.Matched, Equals, 4)
 	c.Assert(info.UpsertedId, IsNil)
 
 	result := &struct{ N int }{}
@@ -676,6 +693,7 @@ func (s *S) TestRemoveAll(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(info.Updated, Equals, 0)
 	c.Assert(info.Removed, Equals, 3)
+	c.Assert(info.Matched, Equals, 3)
 	c.Assert(info.UpsertedId, IsNil)
 
 	n, err := coll.Find(nil).Count()
@@ -817,6 +835,76 @@ func (s *S) TestCreateCollectionForceIndex(c *C) {
 	c.Assert(indexes, HasLen, 1)
 }
 
+func (s *S) TestCreateCollectionValidator(c *C) {
+	if !s.versionAtLeast(3, 2) {
+		c.Skip("validation depends on MongoDB 3.2+")
+	}
+	session, err := mgo.Dial("localhost:40001")
+	c.Assert(err, IsNil)
+	defer session.Close()
+
+	db := session.DB("mydb")
+	coll := db.C("mycoll")
+
+	// Test Validator.
+	info := &mgo.CollectionInfo{
+		Validator: M{"b": M{"$exists": true}},
+	}
+	err = coll.Create(info)
+	c.Assert(err, IsNil)
+	err = coll.Insert(M{"a": 1})
+	c.Assert(err, ErrorMatches, "Document failed validation")
+	err = coll.DropCollection()
+	c.Assert(err, IsNil)
+
+	// Test ValidatorAction.
+	info = &mgo.CollectionInfo{
+		Validator:        M{"b": M{"$exists": true}},
+		ValidationAction: "warn",
+	}
+	err = coll.Create(info)
+	c.Assert(err, IsNil)
+	err = coll.Insert(M{"a": 1})
+	c.Assert(err, IsNil)
+	err = coll.DropCollection()
+	c.Assert(err, IsNil)
+
+	// Test ValidationLevel.
+	info = &mgo.CollectionInfo{
+		Validator:       M{"a": M{"$exists": true}},
+		ValidationLevel: "moderate",
+	}
+	err = coll.Create(info)
+	err = coll.Insert(M{"a": 1})
+	c.Assert(err, IsNil)
+	err = db.Run(bson.D{{"collMod", "mycoll"}, {"validator", M{"b": M{"$exists": true}}}}, nil)
+	c.Assert(err, IsNil)
+	err = coll.Insert(M{"a": 2})
+	c.Assert(err, ErrorMatches, "Document failed validation")
+	err = coll.Update(M{"a": 1}, M{"c": 1})
+	c.Assert(err, IsNil)
+	err = coll.DropCollection()
+	c.Assert(err, IsNil)
+}
+
+func (s *S) TestCreateCollectionStorageEngine(c *C) {
+	if !s.versionAtLeast(3, 0) {
+		c.Skip("storageEngine option depends on MongoDB 3.0+")
+	}
+	session, err := mgo.Dial("localhost:40001")
+	c.Assert(err, IsNil)
+	defer session.Close()
+
+	db := session.DB("mydb")
+	coll := db.C("mycoll")
+
+	info := &mgo.CollectionInfo{
+		StorageEngine: M{"test": M{}},
+	}
+	err = coll.Create(info)
+	c.Assert(err, ErrorMatches, "test is not a registered storage engine for this server")
+}
+
 func (s *S) TestIsDupValues(c *C) {
 	c.Assert(mgo.IsDup(nil), Equals, false)
 	c.Assert(mgo.IsDup(&mgo.LastError{Code: 1}), Equals, false)
@@ -926,13 +1014,15 @@ func (s *S) TestFindAndModify(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(result["n"], Equals, 42)
 	c.Assert(info.Updated, Equals, 1)
+	c.Assert(info.Matched, Equals, 1)
 	c.Assert(info.Removed, Equals, 0)
 	c.Assert(info.UpsertedId, IsNil)
 
 	// A nil result parameter should be acceptable.
 	info, err = coll.Find(M{"n": 43}).Apply(mgo.Change{Update: M{"$unset": M{"missing": 1}}}, nil)
 	c.Assert(err, IsNil)
-	c.Assert(info.Updated, Equals, 1)
+	c.Assert(info.Updated, Equals, 1) // On 2.6+ this feels like a server mistake.
+	c.Assert(info.Matched, Equals, 1)
 	c.Assert(info.Removed, Equals, 0)
 	c.Assert(info.UpsertedId, IsNil)
 
@@ -2672,7 +2762,8 @@ func (s *S) TestQueryErrorNext(c *C) {
 
 	iter := coll.Find(M{"a": 1}).Select(M{"a": M{"b": 1}}).Iter()
 
-	ok := iter.Next(nil)
+	var result struct{}
+	ok := iter.Next(&result)
 	c.Assert(ok, Equals, false)
 
 	err = iter.Close()
